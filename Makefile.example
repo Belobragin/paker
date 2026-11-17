@@ -1,0 +1,65 @@
+SHELL=/bin/bash
+
+include .env.local
+include makefile-test
+include makefile-aws
+
+## ----------------------------------------------------------------------
+## This is a help comment. The purpose of this Makefile is to process 
+## pet project wfn (main werewolf api server).
+## Help comments are displayed in the order defined within the Makefile
+## All comands are initiated with make (command) if not stated otherwise
+## ----------------------------------------------------------------------
+
+help:	## Show this help.
+	@sed -ne '/@sed/!s/## //p' $(MAKEFILE_LIST)
+
+
+.PHONY: lcreatestorage
+lcreatestorage: ## create local storage - this command is run once
+	@mkdir -p $(IMAGE_LOCAL_STORAGE) && \
+	mkdir -p $(ADVERSARIAL_LOCAL_STORAGE) && \
+	mkdir -p $(FILTER_LOCAL_STORAGE) && \
+	echo All storage foders prepared && \
+	mkdir -p $(DOWNLOADS_OBJECTS_FOLDER) && \
+	echo ./downloads foder prepared
+
+.PHONY: lvenv
+lvenv: ## create the local virtual environment and install run and test libraries
+	@python3 -m venv .venv && \
+	source .venv/bin/activate && \
+	python -m pip install -q -r requirements.txt -r requirements-test.txt
+	@echo Local virtual environment created, libraries installed
+	
+
+.PHONY: lakerstart
+lakerstart: ### start aker application in the local container
+	@docker compose --env-file .env.local -f ./iac/local/aker-compose.yaml up --build -d
+
+
+.PHONY: lakerstartf
+lakerstartf: ### start-force recreate aker application in the local container
+	@docker compose --env-file .env.local -f ./iac/local/aker-compose.yaml up --build -d \
+			--force-recreate
+
+
+.PHONY: lakerstop
+lakerstop: ### stop aker application run in the local container
+	@docker compose --env-file .env.local -f ./iac/local/aker-compose.yaml down
+
+
+.PHONY: lrun
+lrun: ### start aker application locally in the terminal window (no container), with local storage and nats
+	@source .venv/bin/activate && source ./.env.local && python3 -m local.main
+
+
+.PHONY: lcrun
+lcrun: ### start aker application locally (no container), with cloud storage and sqs queues
+	@source .venv/bin/activate && source ./.env.awscloud && python3 -m cloud.main
+
+
+.PHONY: laktests
+laktests:	## run the local tests from ./tests in the virtual environment, extra pytest arguments: a="-k cloud_proc"
+	@source .venv/bin/activate && \
+	python -m pip install -q -r requirements-test.txt && \
+	python -m pytest $(a)

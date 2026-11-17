@@ -1,0 +1,547 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CodePipeline for aker: GitHub source, tests, container build pushed to the
+  aker ECR repository, deploy to the aker ECS Fargate service.
+
+Parameters:
+# always in input parameters:
+  ProjectName:
+    Description: The name of the project.
+    Type: String
+    Default: aker
+# with defaults
+  AkerCodePipelineName:
+    Description: Name prefix of the CodePipeline pipeline
+    Type: String
+    Default: aker-pipeline
+  BranchName:
+    Description: Git branch that starts the pipeline
+    Type: String
+    Default: main
+  CodePipelineBucketPrefix:
+    Description: Name prefix of the pipeline artifact bucket
+    Type: String
+    Default: aker-pipeline
+  AkerEcrStackName:
+    Description: Stack created from AkerEcrTemplate.yaml
+    Type: String
+    Default: aker-bvv-ecr
+  AkerEcsStackName:
+    Description: Stack the pipeline updates from AkerEcsTemplate.yaml (cluster, security group, log group, roles)
+    Type: String
+    Default: aker-bvv-cf-resource
+  EcsTemplatePath:
+    Description: Resource stack template, relative to the repository root
+    Type: String
+    Default: iac/awscloud/template/AkerEcsTemplate.yaml
+  EcsParameterFilePath:
+    Description: Resource stack parameters in the CodePipeline template configuration format (a Parameters object), relative to the repository root
+    Type: String
+    Default: iac/awscloud/parameter/aker_resource_pipeline_parameter.json
+  AkerServiceStackName:
+    Description: Stack deployed by the pipeline from AkerServiceTemplate.yaml (task definition and service)
+    Type: String
+    Default: aker-bvv-cf-service
+  ServiceTemplatePath:
+    Description: Service stack template, relative to the repository root
+    Type: String
+    Default: iac/awscloud/template/AkerServiceTemplate.yaml
+  ServiceParameterFilePath:
+    Description: Service stack parameters in the CodePipeline template configuration format, relative to the repository root
+    Type: String
+    Default: iac/awscloud/parameter/aker-service-parameter.json
+  DockerfilePath:
+    Description: Dockerfile of the aker container, relative to the repository root
+    Type: String
+    Default: iac/awscloud/ecs-container/Dockerfile.awscloud
+# no defaults: 
+  AppVersion:
+    Description: Version of the aker application, used as the image tag v<AppVersion> and as VERSION of the running container
+    Type: String
+    AllowedPattern: '^[0-9A-Za-z][0-9A-Za-z._-]*$'
+  GithubFullRepositoryId:
+    Description: GitHub repository the pipeline pulls from, as owner/name
+    Type: String
+
+Resources:
+  # created PENDING: authorize it once in the console (Developer Tools > Connections) before the first run
+  GithubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Sub "${ProjectName}-github"
+      ProviderType: GitHub
+
+  CodePipelineArtifactStoreS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - "-"
+        - - !Ref CodePipelineBucketPrefix
+          - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - "bucket"
+          - !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split
+                  - "/"
+                  - !Ref AWS::StackId
+      VersioningConfiguration:
+        Status: Enabled
+
+  CodePipelineArtifactStoreS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CodePipelineArtifactStoreS3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${CodePipelineArtifactStoreS3Bucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt CodePipelineArtifactStoreS3Bucket.Arn
+              - !Sub "${CodePipelineArtifactStoreS3Bucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AkerPipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: !GetAtt CodePipelineArtifactStoreS3Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub "${CodePipelineArtifactStoreS3Bucket.Arn}/*"
+              # the artifact bucket policy requires aws:kms encryption
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "s3.${AWS::Region}.amazonaws.com"
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !Ref GithubConnection
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt AkerTestProject.Arn
+                  - !GetAtt AkerBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AkerEcsStackName}/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AkerServiceStackName}/*"
+              # this action does not support resource-level permissions
+              - Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt CloudFormationResourceRole.Arn
+                  - !GetAtt CloudFormationDeployRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+
+  CloudFormationResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AkerResourceStackPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:DeleteCluster
+                  - ecs:DescribeClusters
+                  - ecs:UpdateCluster
+                  - ecs:UpdateClusterSettings
+                  - ecs:PutClusterCapacityProviders
+                  - ecs:TagResource
+                  - ecs:UntagResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-ecs-*"
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: ecs.amazonaws.com
+
+  CloudFormationDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AkerServiceStackPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # task definition actions do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - ecs:CreateService
+                  - ecs:UpdateService
+                  - ecs:DeleteService
+                  - ecs:DescribeServices
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:TagResource
+                  - ecs:UntagResource
+                Resource: "*"
+              # the roles created by AkerEcsTemplate.yaml
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-ecs-*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AkerCodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: !GetAtt CodePipelineArtifactStoreS3Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub "${CodePipelineArtifactStoreS3Bucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "s3.${AWS::Region}.amazonaws.com"
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                Resource: !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/*"
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !ImportValue
+                  Fn::Sub: "${AkerEcrStackName}-RepositoryArn"
+
+  AkerTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-test-stage"
+      Description: Run the aker tests
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            install:
+              runtime-versions:
+                python: 3.11
+              commands:
+                # the repo pins 3.11.12 for local work, pyenv in CodeBuild has another 3.11.x
+                - rm -f .python-version
+                - pip install --no-cache-dir -r requirements.txt -r requirements-test.txt tensorflow-cpu==2.21.0
+            build:
+              commands:
+                - mkdir -p reports
+                - python -m pytest -q --html=reports/pytest.html --self-contained-html
+          artifacts:
+            files:
+              - pytest.html
+            base-directory: reports
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM        
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+
+  AkerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-build-container"
+      Description: Build the aker container and push it to the aker ECR repository
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+                  region="${AWS_DEFAULT_REGION:?}"
+                  aws ecr get-login-password --region "$region" \
+                    | docker login --username AWS --password-stdin "${ECR_REPOSITORY_URI%%/*}"
+                  docker build -f "$DOCKERFILE_PATH" \
+                    -t "$ECR_REPOSITORY_URI:v$VERSION" \
+                    -t "$ECR_REPOSITORY_URI:latest" .
+                  docker push "$ECR_REPOSITORY_URI:v$VERSION"
+                  docker push "$ECR_REPOSITORY_URI:latest"
+                  # the digest changes with every build, the v<VERSION> tag does not, so the service stack still gets a new revision
+                  image_uri=$(docker inspect --format '{{index .RepoDigests 0}}' "$ECR_REPOSITORY_URI:v$VERSION")
+                  printf '{"ImageUri":"%s","AppVersion":"%s"}' "$image_uri" "$VERSION" > image.json
+          artifacts:
+            files:
+              - image.json
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPOSITORY_URI
+            Value: !ImportValue
+              Fn::Sub: "${AkerEcrStackName}-RepositoryURI"
+          - Name: DOCKERFILE_PATH
+            Value: !Ref DockerfilePath
+          - Name: VERSION
+            Value: !Ref AppVersion
+
+  AkerCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${AkerCodePipelineName}-${AWS::AccountId}-${AWS::Region}"
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactStoreS3Bucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GithubConnection
+                FullRepositoryId: !Ref GithubFullRepositoryId
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: "true"
+              OutputArtifacts:
+                - Name: SourceArtifact
+
+        - Name: UpdateResources
+          Actions:
+            - Name: UpdateResourceStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationResourceRole.Arn
+                StackName: !Ref AkerEcsStackName
+                TemplateConfiguration: !Sub "SourceArtifact::${EcsParameterFilePath}"
+                TemplatePath: !Sub "SourceArtifact::${EcsTemplatePath}"
+              InputArtifacts:
+                - Name: SourceArtifact
+
+        - Name: Test
+          Actions:
+            - Name: Test
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref AkerTestProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: TestReportArtifact
+
+        - Name: Build
+          Actions:
+            - Name: BuildContainer
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref AkerBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployService
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Ref AkerServiceStackName
+                RoleArn: !GetAtt CloudFormationDeployRole.Arn
+                TemplatePath: !Sub "SourceArtifact::${ServiceTemplatePath}"
+                TemplateConfiguration: !Sub "SourceArtifact::${ServiceParameterFilePath}"
+                ParameterOverrides: '{"ImageUri":{"Fn::GetParam":["BuildArtifact","image.json","ImageUri"]},"AppVersion":{"Fn::GetParam":["BuildArtifact","image.json","AppVersion"]}}'
+              InputArtifacts:
+                - Name: SourceArtifact
+                - Name: BuildArtifact
+
+Outputs:
+  AkerCodePipelineName:
+    Description: Name of the aker pipeline
+    Value: !Ref AkerCodePipeline
+  GithubConnectionArn:
+    Description: GitHub connection to authorize in the console after the first deploy
+    Value: !Ref GithubConnection
+  CodePipelineArtifactBucket:
+    Description: Pipeline artifact bucket
+    Value: !Ref CodePipelineArtifactStoreS3Bucket

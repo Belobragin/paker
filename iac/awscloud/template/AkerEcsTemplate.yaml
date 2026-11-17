@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AWS CloudFormation Template for the aker ECS Fargate infrastructure: cluster, security group,
+  log group and IAM roles. The task definition and the service are deployed by the pipeline
+  (AkerServiceTemplate.yaml).
+Parameters:
+  ProjectName:
+    Description: The name of the project
+    Type: String
+    Default: aker
+  CloudWatchLogGroupName:
+    Description: CloudWatch log group name for ECS tasks
+    Type: String
+    Default: "/ecs/aker"
+  WerewolfResourceStackName:
+    Description: CloudFormation stack with the werewolf resources (VPC, SQS queues, project bucket)
+    Type: String
+    Default: werewolf-bvv-cf-resource
+  WerewolfResourcePrefix:
+    Description: Prefix of the output and export names in the werewolf resource stack (AWS_RESOURCE_PREFIX)
+    Type: String
+    Default: Werewolf
+
+Resources:
+  # Security Groups: the only inbound source is the private IP of the werewolf EC2 instance
+  EcsTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for aker ECS service, inbound from the werewolf EC2 instance only
+      VpcId: !ImportValue
+          Fn::Sub: "${WerewolfResourceStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          # CidrIp: 10.0.1.0/24 
+          CidrIp: !ImportValue 
+            Fn::Sub: "${WerewolfResourceStackName}-PublicSubnet1Cidr"
+          Description: Werewolf EC2 instance
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Groups
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref CloudWatchLogGroupName
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ECS Cluster
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 0
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Roles
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ecs-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRPullPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource: !GetAtt EcsLogGroup.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AkerTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${WerewolfResourceStackName}/*"
+              - Effect: Allow
+                Action:
+                  - sqs:GetQueueUrl
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:SendMessage
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "${WerewolfResourceStackName}-${WerewolfResourcePrefix}SqsQueueARN"
+                  - !ImportValue
+                    Fn::Sub: "${WerewolfResourceStackName}-${WerewolfResourcePrefix}SqsResultQueueARN"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub
+                  - "${BucketArn}/*"
+                  - BucketArn: !ImportValue
+                      Fn::Sub: "${WerewolfResourceStackName}-${WerewolfResourcePrefix}ProjectBucketArn"
+              # the werewolf queues and bucket are encrypted with a KMS key of that stack
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                Condition:
+                  StringEquals:
+                    "kms:ViaService":
+                      - !Sub "sqs.${AWS::Region}.amazonaws.com"
+                      - !Sub "s3.${AWS::Region}.amazonaws.com"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  EcsClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-EcsClusterName"
+
+  EcsClusterArn:
+    Description: ARN of the ECS cluster
+    Value: !GetAtt EcsCluster.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EcsClusterArn"
+
+  EcsTaskExecutionRoleArn:
+    Description: ARN of the task execution role
+    Value: !GetAtt EcsTaskExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EcsTaskExecutionRoleArn"
+
+  EcsTaskRoleArn:
+    Description: ARN of the task role
+    Value: !GetAtt EcsTaskRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EcsTaskRoleArn"
+
+  SecurityGroupId:
+    Description: Security group ID for ECS tasks
+    Value: !Ref EcsTaskSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
+  LogGroupName:
+    Description: CloudWatch log group name
+    Value: !Ref EcsLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroupName"

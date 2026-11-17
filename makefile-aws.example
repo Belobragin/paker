@@ -1,0 +1,70 @@
+SHELL=/bin/bash
+
+.PHONY: setrepo 
+setrepo:	## create aws ecr repository for aker project. This command is run only once
+	@source .env.awscloud && \
+	aws cloudformation create-stack \
+	--stack-name aker-bvv-ecr \
+	--parameters file://iac/awscloud/parameter/aker-ecr-parameter.json \
+	--template-body file://iac/awscloud/template/AkerEcrTemplate.yaml 
+
+.PHONY: updrepo 
+updrepo:	## update aws ecr repository for aker project parameters.
+	@source .env.awscloud && \
+	aws cloudformation update-stack \
+	--stack-name aker-bvv-ecr \
+	--parameters file://iac/awscloud/parameter/aker-ecr-parameter.json \
+	--template-body file://iac/awscloud/template/AkerEcrTemplate.yaml \
+	--capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
+
+
+.PHONY: pushtoecr
+pushtoecr:	## build image from iac/awscloud/ecs-container/Dockerfile.awscloud and push to ECR as v<VERSION> and latest
+	@source .env.awscloud && \
+	set -euo pipefail && \
+	repo_name=$$(aws cloudformation describe-stack-resources \
+		--stack-name $$AWS_RESOURCE_CFN_ECR_STACK_NAME \
+		--query "StackResources[?ResourceType=='AWS::ECR::Repository'].PhysicalResourceId | [0]" \
+		--output text) && \
+	if [ -z "$$repo_name" ] || [ "$$repo_name" = "None" ]; then \
+		echo "no ECR repository in stack $$AWS_RESOURCE_CFN_ECR_STACK_NAME" >&2; exit 1; \
+	fi && \
+	repo_uri=$$(aws ecr describe-repositories --repository-names $$repo_name \
+		--query 'repositories[0].repositoryUri' --output text) && \
+	aws ecr get-login-password | docker login --username AWS --password-stdin $${repo_uri%%/*} && \
+	docker build --provenance=false -f iac/awscloud/ecs-container/Dockerfile.awscloud \
+		-t $$repo_uri:v$$VERSION -t $$repo_uri:latest . && \
+	docker push $$repo_uri:v$$VERSION && \
+	docker push $$repo_uri:latest
+
+
+.PHONY: setpipeline
+setpipeline:	## create or update the aker codepipeline; it then starts by itself after each push to the github main branch
+	@source .env.awscloud && \
+	aws cloudformation deploy \
+	--stack-name "$${AWS_PIPELINE_CFN_STACK_NAME:-aker-bvv-cf-pipeline}" \
+	--template-file iac/awscloud/template/AkerPipelineTemplate.yaml \
+	--parameter-overrides AkerResourceStack="$$AWS_RESOURCE_CFN_STACK_NAME" BranchName=main \
+	--capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM && \
+	echo "first time only: authorize the GitHub connection in the console (Developer Tools > Settings > Connections), then run make runpipe"
+
+
+.PHONY: runpipe 
+runpipe:	## start the codepipeline manually; it also starts by itself after each push to main
+	@source .env.awscloud && \
+	pipeline=$$(aws cloudformation describe-stacks --stack-name "$${AWS_PIPELINE_CFN_STACK_NAME:-aker-bvv-cf-pipeline}" \
+		--query "Stacks[0].Outputs[?OutputKey=='AkerCodePipelineName'].OutputValue" --output text) && \
+	test -n "$$pipeline" && [ "$$pipeline" != None ] || { echo "pipeline not found in stack outputs, run make setpipeline"; exit 1; } && \
+	aws codepipeline start-pipeline-execution --name "$$pipeline"
+
+
+.PHONY: getsqsqueue
+getsqsqueue:	## get url of the sqs queue in the werewolf stack (override stack with v=<stack>)
+	@source .env.awscloud && \
+	stack="$${v:-$$AWS_RESOURCE_CFN_WEREWOLF_STACK_NAME}" && \
+	url=$$(aws cloudformation describe-stacks --stack-name "$$stack" \
+		--query "Stacks[0].Outputs[?OutputKey=='WerewolfSqsQueueURL'].OutputValue" --output text) && \
+	if [ -z "$$url" ] || [ "$$url" = "None" ]; then \
+		echo "no WerewolfSqsQueueURL output in stack $$stack" >&2; exit 1; \
+	fi && \
+	echo "$$url"

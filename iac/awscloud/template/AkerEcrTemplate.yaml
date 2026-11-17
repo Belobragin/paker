@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to create a private ECR repository for Aker project'
+
+Parameters:
+  ProjectName:
+    Description: The name of the project.
+    Type: String
+    AllowedPattern: '^[a-z0-9]+(?:[._-][a-z0-9]+)*$'
+    Default: aker
+
+  RepositoryName:
+    Type: String
+    Description: Name of the ECR repository
+    AllowedPattern: '^[a-z0-9]+(?:[._-][a-z0-9]+)*$'
+    ConstraintDescription: Repository name must be lowercase and can contain letters, numbers, hyphens, underscores, and periods
+    Default: aker
+
+  ImageTagMutability:
+    Type: String
+    Description: Image tag mutability setting for the repository
+    AllowedValues:
+      - MUTABLE
+      - IMMUTABLE
+    Default: MUTABLE
+
+  ScanOnPush:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable automatic scanning of images on push
+
+  LifecyclePolicyText:
+    Type: String
+    Description: Lifecycle policy for the repository (JSON format)
+    Default: |
+      {
+        "rules": [
+          {
+            "rulePriority": 1,
+            "description": "Keep last 4 images",
+            "selection": {
+              "tagStatus": "tagged",
+              "tagPrefixList": ["v"],
+              "countType": "imageCountMoreThan",
+              "countNumber": 4
+            },
+            "action": {
+              "type": "expire"
+            }
+          },
+          {
+            "rulePriority": 2,
+            "description": "Delete untagged images older than 1 day",
+            "selection": {
+              "tagStatus": "untagged",
+              "countType": "sinceImagePushed",
+              "countUnit": "days",
+              "countNumber": 1
+            },
+            "action": {
+              "type": "expire"
+            }
+          }
+        ]
+      }    
+
+Resources:
+  AkerECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageTagMutability: !Ref ImageTagMutability
+      ImageScanningConfiguration:
+        ScanOnPush: !Ref ScanOnPush
+      LifecyclePolicy:
+        LifecyclePolicyText: !Ref LifecyclePolicyText
+      RepositoryPolicyText: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowPushPull",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "arn:aws:iam::${AWS::AccountId}:root"
+              },
+              "Action": [
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:PutImage",
+                "ecr:InitiateLayerUpload",
+                "ecr:UploadLayerPart",
+                "ecr:CompleteLayerUpload",
+                "ecr:GetRepositoryPolicy",
+                "ecr:DescribeRepositories",
+                "ecr:ListImages",
+                "ecr:DescribeImages",
+                "ecr:BatchDeleteImage"
+              ]
+            }
+          ]
+        }
+      Tags:
+        - Key: Name
+          Value: !Ref RepositoryName
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  RepositoryName:
+    Description: Name of the ECR repository
+    Value: !Ref AkerECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryName'
+
+  RepositoryURI:
+    Description: URI of the ECR repository
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AkerECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryURI'
+
+  RepositoryArn:
+    Description: ARN of the ECR repository
+    Value: !GetAtt AkerECRRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryArn'

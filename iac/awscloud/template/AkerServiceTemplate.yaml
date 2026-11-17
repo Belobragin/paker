@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aker ECS Fargate workload: task definition and a long-running service that polls the werewolf
+  SQS queue. Deployed by the pipeline with the image built from the current code; it runs on the
+  cluster, roles and security group of AkerEcsTemplate.yaml.
+Parameters:
+# always in input parameters:
+  ProjectName:
+    Description: The name of the project
+    Type: String
+    Default: aker
+# with defaults:
+  Timezone:
+    Description: Time zone of the aker container
+    Type: String
+    Default: Europe/Belgrade
+  AkerEcsStackName:
+    Description: Stack created from AkerEcsTemplate.yaml
+    Type: String
+    Default: aker-bvv-cf-resource
+  WerewolfResourceStackName:
+    Description: CloudFormation stack with the werewolf resources (VPC, SQS queues, project bucket)
+    Type: String
+    Default: werewolf-bvv-cf-resource
+  WerewolfResourcePrefix:
+    Description: Prefix of the output keys in the werewolf resource stack
+    Type: String
+    Default: Werewolf
+  TaskCpu:
+    Description: CPU units for the task (256, 512, 1024, 2048, 4096)
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "4096"]
+  TaskMemory:
+    Description: Memory for the task in MB (4096-16384 for 2048 CPU, 8192-30720 for 4096 CPU)
+    Type: String
+    Default: "2048"
+    AllowedValues: ["2048", "4096", "8192"]
+  DesiredCount:
+    Description: Number of aker service tasks to keep running
+    Type: Number
+    Default: 1
+    MinValue: 0
+  AppLoggerLevel:
+    Description: Logger level for aker
+    Type: String
+    Default: "INFO"
+    AllowedValues: ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+  AppDebug:
+    Description: Debug error output of the aker container (0 or 1)
+    Type: String
+    Default: "0"
+    AllowedValues: ["0", "1"]
+  BucketStoragePrefix:
+    Description: Top-level key prefix of the objects inside the project bucket (AWS_BUCKET_STORAGE_PREFIX)
+    Type: String
+    Default: storage
+  ImageStorageFolder:
+    Description: Folder of the input images under the storage prefix (IMAGE_STORAGE_FOLDER)
+    Type: String
+    Default: image
+  AdversarialStorageFolder:
+    Description: Folder of the adversarial images under the storage prefix (ADVERSARIAL_STORAGE_FOLDER)
+    Type: String
+    Default: adversarial
+  FilterStorageFolder:
+    Description: Folder of the filter images under the storage prefix (FILTER_STORAGE_FOLDER)
+    Type: String
+    Default: filter
+  SqsProcessingQueueOutput:
+    Description: Output key of the processing queue name in the werewolf stack, after the resource prefix (AWS_SQS_FOR_PROCESSING_CHAN)
+    Type: String
+    Default: SqsQueueName
+  SqsResultQueueOutput:
+    Description: Output key of the result queue name in the werewolf stack, after the resource prefix (AWS_SQS_RESULT_CHAN)
+    Type: String
+    Default: SqsResultQueueName
+  SqsVisibilityTimeout:
+    Description: SQS visibility timeout in seconds, must exceed the longest attack run
+    Type: String
+    Default: "1800"
+# no defaults:
+  ImageUri:
+    Description: Container image with tag or digest, set by the pipeline
+    Type: String
+  AppVersion:
+    Description: Version of the aker application, set by the pipeline
+    Type: String
+
+Resources:
+  EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ProjectName
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: "${AkerEcsStackName}-EcsTaskExecutionRoleArn"
+      TaskRoleArn: !ImportValue
+        Fn::Sub: "${AkerEcsStackName}-EcsTaskRoleArn"
+      ContainerDefinitions:
+        - Name: aker
+          Image: !Ref ImageUri
+          Essential: true
+          # Fargate maximum, lets the SIGTERM handler finish the current message
+          StopTimeout: 120
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: "${AkerEcsStackName}-LogGroupName"
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: aker
+          Environment:
+            - Name: VERSION
+              Value: !Ref AppVersion
+            - Name: TZ
+              Value: !Ref Timezone
+            - Name: LOGGER_LEVEL
+              Value: !Ref AppLoggerLevel
+            - Name: DEBUG
+              Value: !Ref AppDebug
+            - Name: AWS_REGION
+              Value: !Ref "AWS::Region"
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref "AWS::Region"
+            - Name: AWS_RESOURCE_CFN_WEREWOLF_STACK_NAME
+              Value: !Ref WerewolfResourceStackName
+            - Name: AWS_RESOURCE_PREFIX
+              Value: !Ref WerewolfResourcePrefix
+            - Name: AWS_SQS_FOR_PROCESSING_CHAN
+              Value: !Sub "${WerewolfResourcePrefix}${SqsProcessingQueueOutput}"
+            - Name: AWS_SQS_RESULT_CHAN
+              Value: !Sub "${WerewolfResourcePrefix}${SqsResultQueueOutput}"
+            - Name: AWS_BUCKET_STORAGE_PREFIX
+              Value: !Ref BucketStoragePrefix
+            - Name: IMAGE_STORAGE_FOLDER
+              Value: !Ref ImageStorageFolder
+            - Name: ADVERSARIAL_STORAGE_FOLDER
+              Value: !Ref AdversarialStorageFolder
+            - Name: FILTER_STORAGE_FOLDER
+              Value: !Ref FilterStorageFolder
+            - Name: IMAGE_CLOUD_STORAGE
+              Value: !Sub "${BucketStoragePrefix}/${ImageStorageFolder}"
+            - Name: ADVERSARIAL_CLOUD_STORAGE
+              Value: !Sub "${BucketStoragePrefix}/${AdversarialStorageFolder}"
+            - Name: FILTER_CLOUD_STORAGE
+              Value: !Sub "${BucketStoragePrefix}/${FilterStorageFolder}"
+            - Name: SQS_VISIBILITY_TIMEOUT
+              Value: !Ref SqsVisibilityTimeout
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # long-running service: ECS restarts the task if the container exits
+  EcsService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${ProjectName}-service"
+      Cluster: !ImportValue
+        Fn::Sub: "${AkerEcsStackName}-EcsClusterName"
+      TaskDefinition: !Ref EcsTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # the werewolf private subnet has no NAT or endpoints, so ECR, SQS and S3 are reachable only from the public subnet
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: "${AkerEcsStackName}-SecurityGroupId"
+          Subnets:
+            - !ImportValue
+              Fn::Sub: "${WerewolfResourceStackName}-PublicSubnet1"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  EcsServiceName:
+    Description: Name of the aker ECS service
+    Value: !GetAtt EcsService.Name
+
+  TaskDefinitionArn:
+    Description: ARN of the deployed task definition revision
+    Value: !Ref EcsTaskDefinition

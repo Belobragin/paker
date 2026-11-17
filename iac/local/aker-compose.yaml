@@ -1,0 +1,50 @@
+name: aker
+
+services:
+  aker:
+    build:
+      context: ../..
+      dockerfile: iac/local/Dockerfile.local
+      args:
+        AKER_UID: ${AKER_UID:-1000}
+    image: ${AKER_IMAGE:-aker}
+    container_name: ${AKER_CONTAINER:-aker}
+    restart: unless-stopped
+    init: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DEBUG: ${DEBUG:-0}
+      LOGGER_LEVEL: ${LOGGER_LEVEL:-INFO}
+      NATS_ADDRESS: "nats://host.docker.internal:${NATS_PORT:-4222}"
+      NATS_AKER_NAME: ${NATS_AKER_NAME:?NATS_AKER_NAME must be set}
+      NATS_AKER_USER: ${NATS_AKER_USER:?NATS_AKER_USER must be set}
+      NATS_AKER_PSW: ${NATS_AKER_PSW:?NATS_AKER_PSW must be set}
+      NATS_FOR_PROCESSING_CHAN: ${NATS_FOR_PROCESSING_CHAN:?NATS_FOR_PROCESSING_CHAN must be set}
+      NATS_FROM_ALTERED_CHAN: ${NATS_FROM_ALTERED_CHAN:?NATS_FROM_ALTERED_CHAN must be set}
+      RESNET_SERVER_HOST: host.docker.internal
+      RESNET_SERVER_PORT: ${RESNET_SERVER_PORT:-8006}
+      RESNET_PREDICT_PATH: ${RESNET_PREDICT_PATH:-/api/v1/predict}
+      IMAGE_LOCAL_STORAGE: /aker-data/image
+      ADVERSARIAL_LOCAL_STORAGE: /aker-data/adversarial
+      FILTER_LOCAL_STORAGE: /aker-data/filter
+    volumes:
+      - type: bind
+        source: ${IMAGE_LOCAL_STORAGE:?IMAGE_LOCAL_STORAGE must be set}
+        target: /aker-data/image
+        read_only: false
+      - type: bind
+        source: ${ADVERSARIAL_LOCAL_STORAGE:?ADVERSARIAL_LOCAL_STORAGE must be set}
+        target: /aker-data/adversarial
+        read_only: false
+      - type: bind
+        source: ${FILTER_LOCAL_STORAGE:?FILTER_LOCAL_STORAGE must be set}
+        target: /aker-data/filter
+        read_only: false
+
+networks:
+  default:
+    ipam:
+      config:
+        # Explicit subnet: auto-selection fails when VPN routes (0.0.0.0/1, 128.0.0.0/1) overlap all pools.
+        - subnet: ${AKER_SUBNET:-172.30.0.0/24}
